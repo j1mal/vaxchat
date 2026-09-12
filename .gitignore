@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+testkeys/
 # C extensions
 *.so
 
@@ -146,6 +146,10 @@ activemq-data/
 
 # SageMath parsed files
 *.sage.py
+
+# Local app data
+vaxchat.db
+*.db
 
 # Environments
 .env
