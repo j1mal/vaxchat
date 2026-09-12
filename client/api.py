@@ -1,4 +1,5 @@
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -18,6 +19,12 @@ class ChatApi:
 
     def close(self) -> None:
         self._http.close()
+
+    def ws_base(self) -> str:
+        parsed = urlparse(self.base_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        netloc = parsed.netloc or "127.0.0.1:8000"
+        return f"{scheme}://{netloc}"
 
     def _headers(self) -> dict[str, str]:
         if not self.token:
@@ -85,21 +92,44 @@ class ChatApi:
     def delete_contact(self, username: str) -> None:
         self._parse(self._http.delete(f"{self.base_url}/contacts/{username}", headers=self._headers()))
 
-    def send_message(self, recipient: str, ciphertext: str, self_ciphertext: str) -> list[dict]:
+    def list_rooms(self) -> list[dict]:
+        return self._parse(self._http.get(f"{self.base_url}/rooms", headers=self._headers()))
+
+    def create_dm(self, peer_username: str) -> dict:
         return self._parse(
             self._http.post(
-                f"{self.base_url}/messages",
+                f"{self.base_url}/rooms",
                 headers=self._headers(),
-                json={
-                    "recipient": recipient,
-                    "ciphertext": ciphertext,
-                    "self_ciphertext": self_ciphertext,
-                },
+                json={"peer_username": peer_username},
             )
         )
 
-    def list_messages(self, after_id: int = 0, other: str | None = None) -> list[dict]:
-        params: dict[str, Any] = {"after_id": after_id}
-        if other:
-            params["other"] = other
-        return self._parse(self._http.get(f"{self.base_url}/messages", headers=self._headers(), params=params))
+    def create_group(self, name: str, member_usernames: list[str]) -> dict:
+        return self._parse(
+            self._http.post(
+                f"{self.base_url}/rooms",
+                headers=self._headers(),
+                json={"name": name, "member_usernames": member_usernames},
+            )
+        )
+
+    def room_members(self, room_id: int) -> list[dict]:
+        return self._parse(self._http.get(f"{self.base_url}/rooms/{room_id}/members", headers=self._headers()))
+
+    def send_room_message(self, room_id: int, ciphertext: str) -> dict:
+        return self._parse(
+            self._http.post(
+                f"{self.base_url}/rooms/{room_id}/messages",
+                headers=self._headers(),
+                json={"ciphertext": ciphertext},
+            )
+        )
+
+    def list_room_messages(self, room_id: int, after_id: int = 0) -> list[dict]:
+        return self._parse(
+            self._http.get(
+                f"{self.base_url}/rooms/{room_id}/messages",
+                headers=self._headers(),
+                params={"after_id": after_id},
+            )
+        )

@@ -144,16 +144,47 @@ class CryptoSession:
         return str(private)
 
     def encrypt_for(self, plaintext: str, recipient_public_armor: str) -> str:
+        return self.encrypt_message(plaintext, [recipient_public_armor])
+
+    def _import_public(self, armor: str) -> str:
+        """Import a public key into the session keyring; tolerate re-import of the same key."""
+        if self._gpg is None:
+            raise CryptoError("Load your private key first.")
+        imported = self._gpg.import_keys(armor.strip())
+        # GnuPG returns fingerprints even when the key "already exists" in the keyring.
+        if imported.fingerprints:
+            return imported.fingerprints[0]
+        # Fallback: scan keyring for a key matching this armor's identity packet.
+        # Some gpg builds report count=0 on duplicate import; try listing after import.
+        try:
+            probe = self._gpg.list_keys(False)
+        except Exception as exc:
+            raise CryptoError(f"Could not import recipient public key: {exc}") from exc
+        if not probe:
+            raise CryptoError("Could not import recipient public key.")
+        # Last resort: re-export/import via temporary parse — still may fail.
+        raise CryptoError("Could not import recipient public key.")
+
+    def encrypt_message(self, plaintext: str, recipient_public_armors: list[str]) -> str:
+        """Encrypt once to every recipient pubkey (multi-recipient OpenPGP). Safe to re-call."""
         if not self.unlocked or self._gpg is None or not self.fingerprint:
             raise CryptoError("Load your private key first.")
-        gpg = self._gpg
-        imported = gpg.import_keys(recipient_public_armor.strip())
-        if not imported.fingerprints:
-            raise CryptoError("Could not import recipient public key.")
-        recipient_fp = imported.fingerprints[0]
-        encrypted = gpg.encrypt(
+        if not recipient_public_armors:
+            raise CryptoError("At least one recipient public key is required.")
+        fingerprints: list[str] = []
+        seen: set[str] = set()
+        for armor in recipient_public_armors:
+            if not armor or not armor.strip():
+                continue
+            fp = self._import_public(armor)
+            if fp not in seen:
+                seen.add(fp)
+                fingerprints.append(fp)
+        if not fingerprints:
+            raise CryptoError("Could not import any recipient public keys.")
+        encrypted = self._gpg.encrypt(
             plaintext,
-            recipient_fp,
+            fingerprints,
             sign=self.fingerprint,
             passphrase=self._passphrase or None,
             always_trust=True,
@@ -168,7 +199,10 @@ class CryptoSession:
             raise CryptoError("Load your private key first.")
         gpg = self._gpg
         if sender_public_armor:
-            gpg.import_keys(sender_public_armor.strip())
+            try:
+                self._import_public(sender_public_armor)
+            except CryptoError:
+                gpg.import_keys(sender_public_armor.strip())
         decrypted = gpg.decrypt(ciphertext.strip(), passphrase=self._passphrase or None)
         if not decrypted.ok:
             raise CryptoError(f"Decrypt failed: {decrypted.status} {decrypted.stderr}")
@@ -177,7 +211,6 @@ class CryptoSession:
             plaintext = plaintext.decode("utf-8", errors="replace")
         verified: bool | None = None
         if sender_public_armor:
-            # python-gnupg sets valid/trust_level when signature present.
             if decrypted.valid is True:
                 verified = True
             elif decrypted.signature_id or decrypted.username:

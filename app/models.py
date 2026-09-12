@@ -26,10 +26,25 @@ class Contact(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+class Room(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(max_length=64)
+    is_direct: bool = Field(default=False, index=True)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class RoomMember(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("room_id", "user_id"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    room_id: int = Field(foreign_key="room.id", index=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    joined_at: datetime = Field(default_factory=utcnow)
+
+
 class Message(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    room_id: int = Field(foreign_key="room.id", index=True)
     sender_id: int = Field(foreign_key="user.id", index=True)
-    recipient_id: int = Field(foreign_key="user.id", index=True)
-    other_user_id: int = Field(foreign_key="user.id", index=True)
     ciphertext: str
     created_at: datetime = Field(default_factory=utcnow)

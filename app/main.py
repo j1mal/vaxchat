@@ -8,7 +8,8 @@ from app.db import init_db
 from app.rate_limit import limiter
 from app.routers import auth as auth_router
 from app.routers import contacts as contacts_router
-from app.routers import messages as messages_router
+from app.routers import rooms as rooms_router
+from app import ws as ws_router
 
 
 @asynccontextmanager
@@ -28,7 +29,8 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.include_router(auth_router.router)
 app.include_router(auth_router.me_router)
 app.include_router(contacts_router.router)
-app.include_router(messages_router.router)
+app.include_router(rooms_router.router)
+app.include_router(ws_router.router)
 
 
 @app.get("/health")

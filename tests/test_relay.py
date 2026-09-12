@@ -38,7 +38,7 @@ def _auth(token: str) -> dict[str, str]:
 
 def _keypair(name: str) -> CryptoSession:
     session = CryptoSession()
-    session.generate(name)
+    session.generate(name, passphrase="test-passphrase")
     return session
 
 
@@ -67,12 +67,29 @@ def test_duplicate_username(client: TestClient) -> None:
 def test_rejects_plaintext_message(client: TestClient) -> None:
     alice = _register(client, "alice")
     _register(client, "bob")
+    dm = client.post("/rooms", headers=_auth(alice), json={"peer_username": "bob"})
+    assert dm.status_code == 200
+    room_id = dm.json()["id"]
     response = client.post(
-        "/messages",
+        f"/rooms/{room_id}/messages",
         headers=_auth(alice),
-        json={"recipient": "bob", "ciphertext": "hello", "self_ciphertext": "hello"},
+        json={"ciphertext": "hello"},
     )
     assert response.status_code == 400
+
+
+def test_dm_room_get_or_create(client: TestClient) -> None:
+    alice = _register(client, "alice")
+    _register(client, "bob")
+    first = client.post("/rooms", headers=_auth(alice), json={"peer_username": "bob"})
+    assert first.status_code == 200
+    second = client.post("/rooms", headers=_auth(alice), json={"peer_username": "bob"})
+    assert second.status_code == 200
+    assert first.json()["id"] == second.json()["id"]
+    assert first.json()["is_direct"] is True
+    rooms = client.get("/rooms", headers=_auth(alice))
+    assert rooms.status_code == 200
+    assert len(rooms.json()) == 1
 
 
 def test_encrypted_roundtrip(client: TestClient) -> None:
@@ -81,39 +98,33 @@ def test_encrypted_roundtrip(client: TestClient) -> None:
     alice = _keypair("alice")
     bob = _keypair("bob")
 
-    pub_a = client.put("/me", headers=_auth(alice_token), json={"public_key_armor": alice.public_key_armor})
-    pub_b = client.put("/me", headers=_auth(bob_token), json={"public_key_armor": bob.public_key_armor})
-    assert pub_a.status_code == 200
-    assert pub_b.status_code == 200
+    assert client.put("/me", headers=_auth(alice_token), json={"public_key_armor": alice.public_key_armor}).status_code == 200
+    assert client.put("/me", headers=_auth(bob_token), json={"public_key_armor": bob.public_key_armor}).status_code == 200
 
-    add = client.post(
-        "/contacts",
-        headers=_auth(alice_token),
-        json={"username": "bob", "public_key_armor": bob.public_key_armor},
-    )
-    assert add.status_code == 200
-    client.post(
-        "/contacts",
-        headers=_auth(bob_token),
-        json={"username": "alice", "public_key_armor": alice.public_key_armor},
-    )
+    dm = client.post("/rooms", headers=_auth(alice_token), json={"peer_username": "bob"})
+    assert dm.status_code == 200
+    room_id = dm.json()["id"]
+    members = client.get(f"/rooms/{room_id}/members", headers=_auth(alice_token))
+    assert members.status_code == 200
+    pubs = [m["public_key_armor"] for m in members.json() if m.get("public_key_armor")]
+    assert len(pubs) == 2
 
     secret = "meet at dusk"
-    to_bob = alice.encrypt_for(secret, bob.public_key_armor or "")
-    to_self = alice.encrypt_for(secret, alice.public_key_armor or "")
-    assert "BEGIN PGP MESSAGE" in to_bob
-    assert secret not in to_bob
+    ciphertext = alice.encrypt_message(secret, pubs)
+    # Re-encrypt to same members must not fail on keyring conflicts.
+    ciphertext2 = alice.encrypt_message(secret, pubs)
+    assert "BEGIN PGP MESSAGE" in ciphertext2
+    assert secret not in ciphertext
 
     sent = client.post(
-        "/messages",
+        f"/rooms/{room_id}/messages",
         headers=_auth(alice_token),
-        json={"recipient": "bob", "ciphertext": to_bob, "self_ciphertext": to_self},
+        json={"ciphertext": ciphertext},
     )
     assert sent.status_code == 200
-    bodies = sent.json()
-    assert all("BEGIN PGP MESSAGE" in row["ciphertext"] for row in bodies)
+    assert "BEGIN PGP MESSAGE" in sent.json()["ciphertext"]
 
-    inbox = client.get("/messages", headers=_auth(bob_token), params={"after_id": 0})
+    inbox = client.get(f"/rooms/{room_id}/messages", headers=_auth(bob_token), params={"after_id": 0})
     assert inbox.status_code == 200
     rows = inbox.json()
     assert len(rows) == 1
@@ -122,8 +133,8 @@ def test_encrypted_roundtrip(client: TestClient) -> None:
     assert plaintext == secret
     assert verified is True
 
-    alice_copy = client.get("/messages", headers=_auth(alice_token), params={"after_id": 0})
-    copies = alice_copy.json()
+    alice_view = client.get(f"/rooms/{room_id}/messages", headers=_auth(alice_token), params={"after_id": 0})
+    copies = alice_view.json()
     assert len(copies) == 1
     mine, _ = alice.decrypt(copies[0]["ciphertext"], alice.public_key_armor)
     assert mine == secret
@@ -145,34 +156,24 @@ def test_real_testkeys_roundtrip(client: TestClient) -> None:
 
     assert client.put("/me", headers=_auth(jamal_token), json={"public_key_armor": jamal_pub}).status_code == 200
     assert client.put("/me", headers=_auth(jamal1_token), json={"public_key_armor": jamal1_pub}).status_code == 200
-    assert (
-        client.post(
-            "/contacts",
-            headers=_auth(jamal_token),
-            json={"username": "jamal1", "public_key_armor": jamal1_pub},
-        ).status_code
-        == 200
-    )
-    assert (
-        client.post(
-            "/contacts",
-            headers=_auth(jamal1_token),
-            json={"username": "jamal", "public_key_armor": jamal_pub},
-        ).status_code
-        == 200
-    )
+
+    dm = client.post("/rooms", headers=_auth(jamal_token), json={"peer_username": "jamal1"})
+    assert dm.status_code == 200
+    room_id = dm.json()["id"]
 
     secret = "tea at dusk with real keys"
-    to_them = jamal.encrypt_for(secret, jamal1_pub)
-    to_self = jamal.encrypt_for(secret, jamal_pub)
+    ciphertext = jamal.encrypt_message(secret, [jamal_pub, jamal1_pub])
+    # Second encrypt to same peers — must not raise on duplicate import.
+    jamal.encrypt_message(secret, [jamal_pub, jamal1_pub])
+
     sent = client.post(
-        "/messages",
+        f"/rooms/{room_id}/messages",
         headers=_auth(jamal_token),
-        json={"recipient": "jamal1", "ciphertext": to_them, "self_ciphertext": to_self},
+        json={"ciphertext": ciphertext},
     )
     assert sent.status_code == 200, sent.text
 
-    inbox = client.get("/messages", headers=_auth(jamal1_token), params={"after_id": 0})
+    inbox = client.get(f"/rooms/{room_id}/messages", headers=_auth(jamal1_token), params={"after_id": 0})
     assert inbox.status_code == 200
     rows = inbox.json()
     assert len(rows) == 1
@@ -192,3 +193,26 @@ def test_server_cannot_be_given_empty_pgp(client: TestClient) -> None:
         json={"username": "bob", "public_key_armor": "not-a-key"},
     )
     assert response.status_code == 400
+
+
+def test_non_member_cannot_read_room(client: TestClient) -> None:
+    alice = _register(client, "alice")
+    _register(client, "bob")
+    charlie = _register(client, "charlie")
+    dm = client.post("/rooms", headers=_auth(alice), json={"peer_username": "bob"})
+    room_id = dm.json()["id"]
+    denied = client.get(f"/rooms/{room_id}/messages", headers=_auth(charlie))
+    assert denied.status_code == 403
+
+
+def test_websocket_rejects_non_member(client: TestClient) -> None:
+    from starlette.websockets import WebSocketDisconnect
+
+    alice = _register(client, "alice")
+    _register(client, "bob")
+    charlie = _register(client, "charlie")
+    dm = client.post("/rooms", headers=_auth(alice), json={"peer_username": "bob"})
+    room_id = dm.json()["id"]
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(f"/ws/{room_id}?token={charlie}"):
+            pass

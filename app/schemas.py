@@ -39,16 +39,32 @@ class ContactOut(BaseModel):
     public_key_armor: str
 
 
-class MessageIn(BaseModel):
-    recipient: str
-    ciphertext: str
-    self_ciphertext: str
+class RoomCreate(BaseModel):
+    name: str = Field(default="", max_length=64)
+    member_usernames: list[str] = Field(default_factory=list)
+    peer_username: str | None = None
 
 
-class MessageOut(BaseModel):
+class RoomMemberOut(BaseModel):
+    username: str
+    public_key_armor: str | None = None
+
+
+class RoomOut(BaseModel):
     id: int
+    name: str
+    is_direct: bool
+    members: list[RoomMemberOut]
+
+
+class RoomMessageIn(BaseModel):
+    ciphertext: str
+
+
+class RoomMessageOut(BaseModel):
+    id: int
+    room_id: int
     sender_username: str
-    other_username: str
     ciphertext: str
     created_at: datetime
     is_outgoing: bool

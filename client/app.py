@@ -11,13 +11,24 @@ from client.worker import BackgroundWorker
 QUEUE_MS = 100
 DEFAULT_SERVER = "http://127.0.0.1:8000"
 
+# Telegram Desktop-inspired palette
+COLOR_BG = "#0E1621"
+COLOR_SIDEBAR = "#17212B"
+COLOR_ACCENT = "#5288C1"
+COLOR_BUBBLE_OUT = "#2B5278"
+COLOR_BUBBLE_IN = "#182533"
+COLOR_TEXT = "#F5F5F5"
+COLOR_MUTED = "#7F91A4"
+COLOR_INPUT = "#242F3D"
+
 
 class VaxChatApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("vaxchat")
-        self.geometry("980x640")
-        self.minsize(820, 520)
+        self.geometry("1000x660")
+        self.minsize(860, 540)
+        self.configure(fg_color=COLOR_BG)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -25,15 +36,16 @@ class VaxChatApp(ctk.CTk):
         self._out: queue.Queue = queue.Queue()
         self.worker = BackgroundWorker(self._out)
         self.username: str | None = None
-        self.contacts: list[dict] = []
-        self.selected_username: str | None = None
-        self.messages_by_peer: dict[str, list[dict]] = {}
+        self.rooms: list[dict] = []
+        self.selected_room_id: int | None = None
+        self.messages_by_room: dict[str, list[dict]] = {}
         self.unlocked = False
         self._busy = False
         self._queue_job: str | None = None
         self._server_url = DEFAULT_SERVER
+        self._room_buttons: dict[int, ctk.CTkButton] = {}
 
-        self.container = ctk.CTkFrame(self, fg_color="transparent")
+        self.container = ctk.CTkFrame(self, fg_color=COLOR_BG)
         self.container.pack(fill="both", expand=True)
         self._show_login()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -63,19 +75,18 @@ class VaxChatApp(ctk.CTk):
             self._show_main()
         elif kind == "logged_out":
             self.username = None
-            self.contacts = []
-            self.selected_username = None
-            self.messages_by_peer = {}
+            self.rooms = []
+            self.selected_room_id = None
+            self.messages_by_room = {}
             self.unlocked = False
             self._show_login()
-        elif kind == "contacts":
-            self.contacts = payload.get("contacts") or []
-            self._redraw_contacts()
+        elif kind == "rooms":
+            self.rooms = payload.get("rooms") or []
+            self._redraw_rooms()
         elif kind == "messages":
-            self.messages_by_peer = payload.get("messages_by_peer") or {}
+            self.messages_by_room = payload.get("messages_by_room") or {}
             self.unlocked = bool(payload.get("unlocked"))
-            if self.selected_username:
-                self._render_chat()
+            self._render_chat()
         elif kind == "status":
             self._set_status(payload.get("text") or "")
         elif kind == "error":
@@ -92,50 +103,50 @@ class VaxChatApp(ctk.CTk):
             fp = payload.get("fingerprint") or ""
             short = fp[-8:] if fp else "?"
             if hasattr(self, "key_var"):
-                self.key_var.set(f"Private key loaded · {short}")
+                self.key_var.set(f"Key · {short}")
             self.unlocked = True
             self._render_chat()
         elif kind == "key_generated":
             self._on_key_generated(payload)
-        elif kind == "contact_added":
-            self._set_status("Contact added.")
-        elif kind == "contact_removed":
-            if self.selected_username == payload.get("username"):
-                self.selected_username = None
-                if hasattr(self, "chat_title"):
-                    self.chat_title.configure(text="Select a contact")
-                self._render_chat()
+        elif kind == "room_opened":
+            room_id = payload.get("room_id")
+            if room_id is not None:
+                self._select_room(int(room_id))
 
     def _show_login(self) -> None:
         self._clear_container()
-        frame = ctk.CTkFrame(self.container)
+        frame = ctk.CTkFrame(self.container, fg_color=COLOR_SIDEBAR, corner_radius=16)
         frame.place(relx=0.5, rely=0.5, anchor="center")
 
-        ctk.CTkLabel(frame, text="vaxchat", font=ctk.CTkFont(size=28, weight="bold")).pack(padx=40, pady=(28, 4))
+        ctk.CTkLabel(frame, text="vaxchat", font=ctk.CTkFont(size=28, weight="bold"), text_color=COLOR_TEXT).pack(
+            padx=40, pady=(28, 4)
+        )
         ctk.CTkLabel(
             frame,
-            text="Encrypted messages. The server only stores ciphertext.",
-            text_color="gray70",
+            text="Encrypted rooms. The server only stores ciphertext.",
+            text_color=COLOR_MUTED,
         ).pack(pady=(0, 16))
 
-        self.server_entry = ctk.CTkEntry(frame, width=320, placeholder_text="Server URL")
+        self.server_entry = ctk.CTkEntry(frame, width=320, placeholder_text="Server URL", fg_color=COLOR_INPUT)
         self.server_entry.insert(0, self._server_url)
         self.server_entry.pack(padx=40, pady=6)
 
-        self.user_entry = ctk.CTkEntry(frame, width=320, placeholder_text="Username")
+        self.user_entry = ctk.CTkEntry(frame, width=320, placeholder_text="Username", fg_color=COLOR_INPUT)
         self.user_entry.pack(padx=40, pady=6)
 
-        self.pass_entry = ctk.CTkEntry(frame, width=320, placeholder_text="Password", show="•")
+        self.pass_entry = ctk.CTkEntry(frame, width=320, placeholder_text="Password", show="•", fg_color=COLOR_INPUT)
         self.pass_entry.pack(padx=40, pady=6)
 
         btns = ctk.CTkFrame(frame, fg_color="transparent")
         btns.pack(pady=12)
-        ctk.CTkButton(btns, text="Log in", width=140, command=lambda: self._auth(False)).pack(side="left", padx=6)
-        ctk.CTkButton(btns, text="Register", width=140, fg_color="#1f8a4c", command=lambda: self._auth(True)).pack(
+        ctk.CTkButton(btns, text="Log in", width=140, fg_color=COLOR_ACCENT, command=lambda: self._auth(False)).pack(
             side="left", padx=6
         )
+        ctk.CTkButton(
+            btns, text="Register", width=140, fg_color=COLOR_BUBBLE_OUT, command=lambda: self._auth(True)
+        ).pack(side="left", padx=6)
 
-        self.login_status = ctk.CTkLabel(frame, text="", text_color="gray70")
+        self.login_status = ctk.CTkLabel(frame, text="", text_color=COLOR_MUTED)
         self.login_status.pack(padx=40, pady=(4, 24))
         self.pass_entry.bind("<Return>", lambda _e: self._auth(False))
 
@@ -156,61 +167,83 @@ class VaxChatApp(ctk.CTk):
 
     def _show_main(self) -> None:
         self._clear_container()
-        root = ctk.CTkFrame(self.container, fg_color="transparent")
-        root.pack(fill="both", expand=True, padx=12, pady=12)
+        root = ctk.CTkFrame(self.container, fg_color=COLOR_BG)
+        root.pack(fill="both", expand=True)
         root.grid_columnconfigure(1, weight=1)
         root.grid_rowconfigure(1, weight=1)
 
-        top = ctk.CTkFrame(root)
-        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        top = ctk.CTkFrame(root, fg_color=COLOR_SIDEBAR, corner_radius=0, height=52)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew")
         self.key_var = tk.StringVar(value="Private key: not loaded")
-        ctk.CTkLabel(top, text=f"Signed in as {self.username}", font=ctk.CTkFont(weight="bold")).pack(
-            side="left", padx=12, pady=10
+        ctk.CTkLabel(top, text=f"{self.username}", font=ctk.CTkFont(weight="bold"), text_color=COLOR_TEXT).pack(
+            side="left", padx=16, pady=12
         )
-        ctk.CTkLabel(top, textvariable=self.key_var, text_color="gray70").pack(side="left", padx=8)
-        ctk.CTkButton(top, text="Log out", width=80, fg_color="gray30", command=self._logout).pack(
-            side="right", padx=10, pady=8
+        ctk.CTkLabel(top, textvariable=self.key_var, text_color=COLOR_MUTED).pack(side="left", padx=8)
+        ctk.CTkButton(top, text="Log out", width=80, fg_color=COLOR_INPUT, command=self._logout).pack(
+            side="right", padx=12, pady=8
         )
-        ctk.CTkButton(top, text="Generate keys", width=120, command=self._generate_keys).pack(side="right", padx=4)
-        ctk.CTkButton(top, text="Load private key", width=140, command=self._load_key_dialog).pack(side="right", padx=4)
+        ctk.CTkButton(top, text="Generate keys", width=120, fg_color=COLOR_BUBBLE_OUT, command=self._generate_keys).pack(
+            side="right", padx=4
+        )
+        ctk.CTkButton(top, text="Load key", width=100, fg_color=COLOR_ACCENT, command=self._load_key_dialog).pack(
+            side="right", padx=4
+        )
 
-        left = ctk.CTkFrame(root, width=240)
-        left.grid(row=1, column=0, sticky="nsw", padx=(0, 8))
+        left = ctk.CTkFrame(root, width=280, fg_color=COLOR_SIDEBAR, corner_radius=0)
+        left.grid(row=1, column=0, sticky="nsw")
         left.grid_propagate(False)
-        ctk.CTkLabel(left, text="Contacts", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=12, pady=(12, 6))
+        ctk.CTkLabel(left, text="Chats", font=ctk.CTkFont(size=16, weight="bold"), text_color=COLOR_TEXT).pack(
+            anchor="w", padx=16, pady=(16, 8)
+        )
         btnrow = ctk.CTkFrame(left, fg_color="transparent")
-        btnrow.pack(fill="x", padx=8, pady=(0, 8))
-        ctk.CTkButton(btnrow, text="Add", width=70, command=self._add_contact_dialog).pack(side="left", padx=2)
-        ctk.CTkButton(btnrow, text="Remove", width=80, fg_color="gray30", command=self._remove_contact).pack(
+        btnrow.pack(fill="x", padx=12, pady=(0, 8))
+        ctk.CTkButton(btnrow, text="New DM", width=80, fg_color=COLOR_ACCENT, command=self._new_dm_dialog).pack(
             side="left", padx=2
         )
-        self.contact_list = ctk.CTkScrollableFrame(left, width=220)
-        self.contact_list.pack(fill="both", expand=True, padx=8, pady=(0, 12))
+        ctk.CTkButton(btnrow, text="New group", width=90, fg_color=COLOR_BUBBLE_OUT, command=self._new_group_dialog).pack(
+            side="left", padx=2
+        )
+        self.room_list = ctk.CTkScrollableFrame(left, fg_color=COLOR_SIDEBAR, width=260)
+        self.room_list.pack(fill="both", expand=True, padx=8, pady=(0, 12))
 
-        right = ctk.CTkFrame(root)
+        right = ctk.CTkFrame(root, fg_color=COLOR_BG, corner_radius=0)
         right.grid(row=1, column=1, sticky="nsew")
         right.grid_rowconfigure(1, weight=1)
         right.grid_columnconfigure(0, weight=1)
-        self.chat_title = ctk.CTkLabel(right, text="Select a contact", font=ctk.CTkFont(size=16, weight="bold"))
-        self.chat_title.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 4))
-        self.history = ctk.CTkTextbox(right, wrap="word", state="disabled")
-        self.history.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
+        self.chat_title = ctk.CTkLabel(
+            right, text="Select a chat", font=ctk.CTkFont(size=16, weight="bold"), text_color=COLOR_TEXT
+        )
+        self.chat_title.grid(row=0, column=0, sticky="w", padx=18, pady=(14, 6))
 
-        compose = ctk.CTkFrame(right, fg_color="transparent")
-        compose.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 12))
+        self.history = ctk.CTkScrollableFrame(right, fg_color=COLOR_BG)
+        self.history.grid(row=1, column=0, sticky="nsew", padx=10, pady=4)
+
+        compose = ctk.CTkFrame(right, fg_color=COLOR_BG)
+        compose.grid(row=2, column=0, sticky="ew", padx=14, pady=(6, 14))
         compose.grid_columnconfigure(0, weight=1)
-        self.compose = ctk.CTkEntry(compose, placeholder_text="Type a message (encrypted on this machine)")
-        self.compose.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        pill = ctk.CTkFrame(compose, fg_color=COLOR_INPUT, corner_radius=22)
+        pill.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        pill.grid_columnconfigure(0, weight=1)
+        self.compose = ctk.CTkEntry(
+            pill,
+            placeholder_text="Message",
+            fg_color="transparent",
+            border_width=0,
+            text_color=COLOR_TEXT,
+        )
+        self.compose.grid(row=0, column=0, sticky="ew", padx=14, pady=8)
         self.compose.bind("<Return>", lambda _e: self._send())
-        ctk.CTkButton(compose, text="Send", width=90, command=self._send).grid(row=0, column=1)
-
-        self.status_var = tk.StringVar(value="Ready")
-        ctk.CTkLabel(root, textvariable=self.status_var, text_color="gray60", anchor="w").grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0)
+        ctk.CTkButton(compose, text="Send", width=84, corner_radius=18, fg_color=COLOR_ACCENT, command=self._send).grid(
+            row=0, column=1
         )
 
-        self._redraw_contacts()
-        self.worker.submit("refresh_contacts")
+        self.status_var = tk.StringVar(value="Ready")
+        ctk.CTkLabel(root, textvariable=self.status_var, text_color=COLOR_MUTED, anchor="w").grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8)
+        )
+
+        self._redraw_rooms()
+        self.worker.submit("refresh_rooms")
 
     def _logout(self) -> None:
         self.worker.submit("logout")
@@ -225,56 +258,100 @@ class VaxChatApp(ctk.CTk):
         self.worker.shutdown()
         self.destroy()
 
-    def _redraw_contacts(self) -> None:
-        if not hasattr(self, "contact_list"):
-            return
-        for child in self.contact_list.winfo_children():
-            child.destroy()
-        for contact in self.contacts:
-            name = contact["username"]
-            btn = ctk.CTkButton(
-                self.contact_list,
-                text=name,
-                fg_color="transparent",
-                anchor="w",
-                command=lambda n=name: self._select_contact(n),
-            )
-            btn.pack(fill="x", pady=2)
+    def _room_label(self, room: dict) -> str:
+        if room.get("is_direct"):
+            for member in room.get("members") or []:
+                if member.get("username") != self.username:
+                    return member.get("username") or room.get("name") or "DM"
+        return room.get("name") or f"Room {room.get('id')}"
 
-    def _select_contact(self, username: str) -> None:
-        self.selected_username = username
-        self.chat_title.configure(text=username)
+    def _redraw_rooms(self) -> None:
+        if not hasattr(self, "room_list"):
+            return
+        for child in self.room_list.winfo_children():
+            child.destroy()
+        self._room_buttons = {}
+        for room in self.rooms:
+            room_id = int(room["id"])
+            label = self._room_label(room)
+            active = room_id == self.selected_room_id
+            btn = ctk.CTkButton(
+                self.room_list,
+                text=label,
+                anchor="w",
+                fg_color=COLOR_ACCENT if active else "transparent",
+                hover_color=COLOR_BUBBLE_OUT,
+                text_color=COLOR_TEXT,
+                command=lambda rid=room_id: self._select_room(rid),
+            )
+            btn.pack(fill="x", pady=2, padx=4)
+            self._room_buttons[room_id] = btn
+
+    def _select_room(self, room_id: int) -> None:
+        self.selected_room_id = room_id
+        room = next((r for r in self.rooms if int(r["id"]) == room_id), None)
+        title = self._room_label(room) if room else f"Room {room_id}"
+        if hasattr(self, "chat_title"):
+            self.chat_title.configure(text=title)
+        self._redraw_rooms()
+        self.worker.submit("select_room", room_id=room_id)
         self._render_chat()
 
     def _render_chat(self) -> None:
         if not hasattr(self, "history"):
             return
-        self.history.configure(state="normal")
-        self.history.delete("1.0", "end")
-        if not self.selected_username:
-            self.history.configure(state="disabled")
+        for child in self.history.winfo_children():
+            child.destroy()
+        if self.selected_room_id is None:
             return
         if not self.unlocked:
-            self.history.insert("end", "Load your private key to decrypt this conversation.\n")
-            # Still show any placeholder lines if present.
-        rows = self.messages_by_peer.get(self.selected_username, [])
+            ctk.CTkLabel(
+                self.history,
+                text="Load your private key to decrypt this conversation.",
+                text_color=COLOR_MUTED,
+            ).pack(anchor="w", padx=8, pady=8)
+        rows = self.messages_by_room.get(str(self.selected_room_id), [])
         if not rows and self.unlocked:
-            self.history.insert("end", "No messages yet.\n")
+            ctk.CTkLabel(self.history, text="No messages yet.", text_color=COLOR_MUTED).pack(anchor="w", padx=8, pady=8)
         for row in rows:
+            outgoing = bool(row.get("is_outgoing"))
+            wrap = ctk.CTkFrame(self.history, fg_color="transparent")
+            wrap.pack(fill="x", pady=4, padx=6)
+            bubble = ctk.CTkFrame(
+                wrap,
+                fg_color=COLOR_BUBBLE_OUT if outgoing else COLOR_BUBBLE_IN,
+                corner_radius=12,
+            )
+            if outgoing:
+                bubble.pack(anchor="e", padx=(80, 4))
+            else:
+                bubble.pack(anchor="w", padx=(4, 80))
             who = row.get("who") or "?"
             mark = row.get("mark") or ""
             text = row.get("text") or ""
-            self.history.insert("end", f"{who}{mark}: {text}\n")
-        self.history.see("end")
-        self.history.configure(state="disabled")
+            ctk.CTkLabel(
+                bubble,
+                text=f"{who}{mark}",
+                text_color=COLOR_MUTED,
+                font=ctk.CTkFont(size=11),
+                anchor="w",
+            ).pack(anchor="w", padx=12, pady=(8, 0))
+            ctk.CTkLabel(
+                bubble,
+                text=text,
+                text_color=COLOR_TEXT,
+                wraplength=420,
+                justify="left",
+                anchor="w",
+            ).pack(anchor="w", padx=12, pady=(2, 10))
 
     def _send(self) -> None:
         if self._busy:
             return
-        peer = self.selected_username
+        room_id = self.selected_room_id
         text = self.compose.get().strip()
-        if not peer:
-            self._set_status("Select a contact first.")
+        if room_id is None:
+            self._set_status("Select a chat first.")
             return
         if not text:
             return
@@ -284,18 +361,73 @@ class VaxChatApp(ctk.CTk):
         self.compose.delete(0, "end")
         self._busy = True
         self._set_status("Encrypting…")
-        self.worker.submit("send", peer=peer, text=text)
+        self.worker.submit("send", room_id=room_id, text=text)
+
+    def _new_dm_dialog(self) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("New DM")
+        dialog.geometry("520x420")
+        dialog.configure(fg_color=COLOR_SIDEBAR)
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text="Peer username", text_color=COLOR_TEXT).pack(anchor="w", padx=16, pady=(16, 4))
+        user = ctk.CTkEntry(dialog, fg_color=COLOR_INPUT)
+        user.pack(fill="x", padx=16)
+        ctk.CTkLabel(
+            dialog,
+            text="Their PGP public key (required unless they already published one)",
+            text_color=COLOR_TEXT,
+        ).pack(anchor="w", padx=16, pady=(12, 4))
+        box = ctk.CTkTextbox(dialog, height=200, fg_color=COLOR_INPUT)
+        box.pack(fill="both", expand=True, padx=16, pady=6)
+
+        def accept() -> None:
+            peer = user.get().strip()
+            armor = box.get("1.0", "end").strip()
+            if not peer:
+                messagebox.showerror("DM", "Username required.", parent=dialog)
+                return
+            self.worker.submit("create_dm", peer_username=peer, public_key_armor=armor)
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="Open", fg_color=COLOR_ACCENT, command=accept).pack(pady=16)
+
+    def _new_group_dialog(self) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("New group")
+        dialog.geometry("420x260")
+        dialog.configure(fg_color=COLOR_SIDEBAR)
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text="Group name", text_color=COLOR_TEXT).pack(anchor="w", padx=16, pady=(16, 4))
+        name = ctk.CTkEntry(dialog, fg_color=COLOR_INPUT)
+        name.pack(fill="x", padx=16)
+        ctk.CTkLabel(dialog, text="Members (comma-separated usernames)", text_color=COLOR_TEXT).pack(
+            anchor="w", padx=16, pady=(12, 4)
+        )
+        members = ctk.CTkEntry(dialog, fg_color=COLOR_INPUT)
+        members.pack(fill="x", padx=16)
+
+        def accept() -> None:
+            names = [n.strip() for n in members.get().split(",") if n.strip()]
+            self.worker.submit("create_group", name=name.get().strip(), member_usernames=names)
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="Create", fg_color=COLOR_ACCENT, command=accept).pack(pady=16)
 
     def _load_key_dialog(self) -> None:
         dialog = ctk.CTkToplevel(self)
         dialog.title("Load private key")
         dialog.geometry("520x420")
+        dialog.configure(fg_color=COLOR_SIDEBAR)
         dialog.transient(self)
         dialog.grab_set()
-        ctk.CTkLabel(dialog, text="Paste an ASCII-armored private key, or open a file.").pack(padx=16, pady=(16, 8))
-        box = ctk.CTkTextbox(dialog, height=220)
+        ctk.CTkLabel(dialog, text="Paste an ASCII-armored private key, or open a file.", text_color=COLOR_TEXT).pack(
+            padx=16, pady=(16, 8)
+        )
+        box = ctk.CTkTextbox(dialog, height=220, fg_color=COLOR_INPUT)
         box.pack(fill="both", expand=True, padx=16, pady=8)
-        phrase = ctk.CTkEntry(dialog, placeholder_text="Passphrase (if the key is protected)", show="•")
+        phrase = ctk.CTkEntry(dialog, placeholder_text="Passphrase", show="•", fg_color=COLOR_INPUT)
         phrase.pack(fill="x", padx=16, pady=6)
 
         def from_file() -> None:
@@ -321,37 +453,38 @@ class VaxChatApp(ctk.CTk):
 
         row = ctk.CTkFrame(dialog, fg_color="transparent")
         row.pack(pady=12)
-        ctk.CTkButton(row, text="Open file…", command=from_file).pack(side="left", padx=6)
-        ctk.CTkButton(row, text="Unlock", command=accept).pack(side="left", padx=6)
+        ctk.CTkButton(row, text="Open file…", fg_color=COLOR_BUBBLE_OUT, command=from_file).pack(side="left", padx=6)
+        ctk.CTkButton(row, text="Unlock", fg_color=COLOR_ACCENT, command=accept).pack(side="left", padx=6)
 
     def _generate_keys(self) -> None:
         dialog = ctk.CTkToplevel(self)
         dialog.title("Generate keypair")
         dialog.geometry("420x240")
+        dialog.configure(fg_color=COLOR_SIDEBAR)
         dialog.transient(self)
         dialog.grab_set()
-        ctk.CTkLabel(dialog, text="An Ed25519/Cv25519 key will be created on this machine.").pack(
+        ctk.CTkLabel(dialog, text="An Ed25519/Cv25519 key will be created locally.", text_color=COLOR_TEXT).pack(
             padx=16, pady=(16, 8)
         )
-        name = ctk.CTkEntry(dialog, placeholder_text="Name on the key")
+        name = ctk.CTkEntry(dialog, placeholder_text="Name on the key", fg_color=COLOR_INPUT)
         name.insert(0, self.username or "vaxchat")
         name.pack(fill="x", padx=16, pady=6)
-        phrase = ctk.CTkEntry(dialog, placeholder_text="Optional passphrase", show="•")
+        phrase = ctk.CTkEntry(dialog, placeholder_text="Optional passphrase", show="•", fg_color=COLOR_INPUT)
         phrase.pack(fill="x", padx=16, pady=6)
-        status = ctk.CTkLabel(dialog, text="")
+        status = ctk.CTkLabel(dialog, text="", text_color=COLOR_MUTED)
         status.pack(pady=4)
         self._gen_dialog = dialog
         self._gen_status = status
 
         def go() -> None:
-            status.configure(text="Generating… this can take a few seconds.")
+            status.configure(text="Generating…")
             self.worker.submit(
                 "generate_key",
                 name=name.get().strip() or "vaxchat",
                 passphrase=phrase.get(),
             )
 
-        ctk.CTkButton(dialog, text="Generate", command=go).pack(pady=12)
+        ctk.CTkButton(dialog, text="Generate", fg_color=COLOR_ACCENT, command=go).pack(pady=12)
 
     def _on_key_generated(self, payload: dict) -> None:
         dialog = getattr(self, "_gen_dialog", None)
@@ -377,42 +510,10 @@ class VaxChatApp(ctk.CTk):
             dialog.destroy()
         short = fp[-8:] if fp else "?"
         if hasattr(self, "key_var"):
-            self.key_var.set(f"Private key loaded · {short}")
+            self.key_var.set(f"Key · {short}")
         self.unlocked = True
         self._set_status("Key generated.")
         self._render_chat()
-
-    def _add_contact_dialog(self) -> None:
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Add contact")
-        dialog.geometry("520x380")
-        dialog.transient(self)
-        dialog.grab_set()
-        ctk.CTkLabel(dialog, text="Username").pack(anchor="w", padx=16, pady=(16, 4))
-        user = ctk.CTkEntry(dialog)
-        user.pack(fill="x", padx=16)
-        ctk.CTkLabel(dialog, text="Their PGP public key (leave empty if they published one)").pack(
-            anchor="w", padx=16, pady=(12, 4)
-        )
-        box = ctk.CTkTextbox(dialog, height=180)
-        box.pack(fill="both", expand=True, padx=16, pady=6)
-
-        def accept() -> None:
-            username = user.get().strip()
-            armor = box.get("1.0", "end").strip()
-            if not username:
-                messagebox.showerror("Contact", "Username required.", parent=dialog)
-                return
-            self.worker.submit("add_contact", username=username, public_key_armor=armor)
-            dialog.destroy()
-
-        ctk.CTkButton(dialog, text="Add", command=accept).pack(pady=12)
-
-    def _remove_contact(self) -> None:
-        if not self.selected_username:
-            self._set_status("Select a contact to remove.")
-            return
-        self.worker.submit("delete_contact", username=self.selected_username)
 
 
 def main() -> None:
