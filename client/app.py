@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import threading
+import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
 import customtkinter as ctk
 
-from client.api import ApiError, ChatApi
-from client.crypto import CryptoError, CryptoSession
+from client.worker import BackgroundWorker
 
-POLL_MS = 3000
+QUEUE_MS = 100
 DEFAULT_SERVER = "http://127.0.0.1:8000"
 
 
@@ -22,20 +22,22 @@ class VaxChatApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.api = ChatApi(DEFAULT_SERVER)
-        self.crypto = CryptoSession()
+        self._out: queue.Queue = queue.Queue()
+        self.worker = BackgroundWorker(self._out)
+        self.username: str | None = None
         self.contacts: list[dict] = []
         self.selected_username: str | None = None
         self.messages_by_peer: dict[str, list[dict]] = {}
-        self.seen_ids: set[int] = set()
-        self.after_id = 0
-        self._poll_job: str | None = None
+        self.unlocked = False
         self._busy = False
+        self._queue_job: str | None = None
+        self._server_url = DEFAULT_SERVER
 
         self.container = ctk.CTkFrame(self, fg_color="transparent")
         self.container.pack(fill="both", expand=True)
         self._show_login()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._drain_queue()
 
     def _clear_container(self) -> None:
         for child in self.container.winfo_children():
@@ -45,8 +47,66 @@ class VaxChatApp(ctk.CTk):
         if hasattr(self, "status_var"):
             self.status_var.set(text)
 
+    def _drain_queue(self) -> None:
+        try:
+            while True:
+                kind, payload = self._out.get_nowait()
+                self._handle_event(kind, payload)
+        except queue.Empty:
+            pass
+        self._queue_job = self.after(QUEUE_MS, self._drain_queue)
+
+    def _handle_event(self, kind: str, payload: dict) -> None:
+        if kind == "auth_ok":
+            self._busy = False
+            self.username = payload.get("username")
+            self._show_main()
+        elif kind == "logged_out":
+            self.username = None
+            self.contacts = []
+            self.selected_username = None
+            self.messages_by_peer = {}
+            self.unlocked = False
+            self._show_login()
+        elif kind == "contacts":
+            self.contacts = payload.get("contacts") or []
+            self._redraw_contacts()
+        elif kind == "messages":
+            self.messages_by_peer = payload.get("messages_by_peer") or {}
+            self.unlocked = bool(payload.get("unlocked"))
+            if self.selected_username:
+                self._render_chat()
+        elif kind == "status":
+            self._set_status(payload.get("text") or "")
+        elif kind == "error":
+            self._busy = False
+            msg = payload.get("message") or "Error"
+            if hasattr(self, "login_status") and self.login_status.winfo_exists():
+                self.login_status.configure(text=msg)
+            self._set_status(msg)
+        elif kind == "send_done":
+            self._busy = False
+            if not payload.get("ok"):
+                self._set_status(payload.get("error") or "Send failed")
+        elif kind == "key_loaded":
+            fp = payload.get("fingerprint") or ""
+            short = fp[-8:] if fp else "?"
+            if hasattr(self, "key_var"):
+                self.key_var.set(f"Private key loaded · {short}")
+            self.unlocked = True
+            self._render_chat()
+        elif kind == "key_generated":
+            self._on_key_generated(payload)
+        elif kind == "contact_added":
+            self._set_status("Contact added.")
+        elif kind == "contact_removed":
+            if self.selected_username == payload.get("username"):
+                self.selected_username = None
+                if hasattr(self, "chat_title"):
+                    self.chat_title.configure(text="Select a contact")
+                self._render_chat()
+
     def _show_login(self) -> None:
-        self._stop_poll()
         self._clear_container()
         frame = ctk.CTkFrame(self.container)
         frame.place(relx=0.5, rely=0.5, anchor="center")
@@ -59,7 +119,7 @@ class VaxChatApp(ctk.CTk):
         ).pack(pady=(0, 16))
 
         self.server_entry = ctk.CTkEntry(frame, width=320, placeholder_text="Server URL")
-        self.server_entry.insert(0, self.api.base_url)
+        self.server_entry.insert(0, self._server_url)
         self.server_entry.pack(padx=40, pady=6)
 
         self.user_entry = ctk.CTkEntry(frame, width=320, placeholder_text="Username")
@@ -88,29 +148,11 @@ class VaxChatApp(ctk.CTk):
         if not username or not password:
             self.login_status.configure(text="Username and password required.")
             return
-        self.api.base_url = server.rstrip("/")
+        self._server_url = server.rstrip("/")
         self.login_status.configure(text="Working…")
         self._busy = True
-
-        def work() -> None:
-            try:
-                if register:
-                    self.api.register(username, password)
-                else:
-                    self.api.login(username, password)
-                err = None
-            except Exception as exc:
-                err = str(exc)
-            self.after(0, lambda: self._auth_done(err))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _auth_done(self, err: str | None) -> None:
-        self._busy = False
-        if err:
-            self.login_status.configure(text=err)
-            return
-        self._show_main()
+        kind = "register" if register else "login"
+        self.worker.submit(kind, username=username, password=password, server=self._server_url)
 
     def _show_main(self) -> None:
         self._clear_container()
@@ -122,7 +164,7 @@ class VaxChatApp(ctk.CTk):
         top = ctk.CTkFrame(root)
         top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         self.key_var = tk.StringVar(value="Private key: not loaded")
-        ctk.CTkLabel(top, text=f"Signed in as {self.api.username}", font=ctk.CTkFont(weight="bold")).pack(
+        ctk.CTkLabel(top, text=f"Signed in as {self.username}", font=ctk.CTkFont(weight="bold")).pack(
             side="left", padx=12, pady=10
         )
         ctk.CTkLabel(top, textvariable=self.key_var, text_color="gray70").pack(side="left", padx=8)
@@ -167,96 +209,28 @@ class VaxChatApp(ctk.CTk):
             row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0)
         )
 
-        self._refresh_contacts()
-        self._start_poll()
+        self._redraw_contacts()
+        self.worker.submit("refresh_contacts")
 
     def _logout(self) -> None:
-        self._stop_poll()
-        self.api.logout()
-        self.crypto.clear()
-        self.contacts = []
-        self.selected_username = None
-        self.messages_by_peer = {}
-        self.seen_ids = set()
-        self.after_id = 0
-        self._show_login()
+        self.worker.submit("logout")
 
     def _on_close(self) -> None:
-        self._stop_poll()
-        self.crypto.clear()
-        self.api.close()
-        self.destroy()
-
-    def _start_poll(self) -> None:
-        self._stop_poll()
-        self._poll()
-
-    def _stop_poll(self) -> None:
-        if self._poll_job is not None:
+        if self._queue_job is not None:
             try:
-                self.after_cancel(self._poll_job)
+                self.after_cancel(self._queue_job)
             except Exception:
                 pass
-            self._poll_job = None
+            self._queue_job = None
+        self.worker.shutdown()
+        self.destroy()
 
-    def _ingest_messages(self, rows: list[dict]) -> None:
-        for row in rows:
-            msg_id = row["id"]
-            if msg_id in self.seen_ids:
-                continue
-            self.seen_ids.add(msg_id)
-            # Outgoing: partner is other_username. Incoming: partner is sender
-            # (also repairs older rows that wrongly set other_user_id to self).
-            if row.get("is_outgoing"):
-                peer = row["other_username"]
-            else:
-                peer = row["sender_username"]
-            self.messages_by_peer.setdefault(peer, []).append(row)
-            self.after_id = max(self.after_id, msg_id)
-
-    def _poll(self) -> None:
-        def work() -> None:
-            try:
-                rows = self.api.list_messages(after_id=self.after_id)
-                err = None
-            except Exception as exc:
-                rows = []
-                err = str(exc)
-            self.after(0, lambda: self._poll_done(rows, err))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _poll_done(self, rows: list[dict], err: str | None) -> None:
-        if err:
-            self._set_status(f"Poll failed: {err}")
-        else:
-            if rows:
-                self._ingest_messages(rows)
-                if self.selected_username:
-                    self._render_chat()
-            self._set_status(f"Polling {self.api.base_url} · last id {self.after_id}")
-        self._poll_job = self.after(POLL_MS, self._poll)
-
-    def _refresh_contacts(self) -> None:
-        def work() -> None:
-            try:
-                rows = self.api.list_contacts()
-                err = None
-            except Exception as exc:
-                rows = []
-                err = str(exc)
-            self.after(0, lambda: self._contacts_done(rows, err))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _contacts_done(self, rows: list[dict], err: str | None) -> None:
-        if err:
-            self._set_status(err)
+    def _redraw_contacts(self) -> None:
+        if not hasattr(self, "contact_list"):
             return
-        self.contacts = rows
         for child in self.contact_list.winfo_children():
             child.destroy()
-        for contact in rows:
+        for contact in self.contacts:
             name = contact["username"]
             btn = ctk.CTkButton(
                 self.contact_list,
@@ -272,38 +246,25 @@ class VaxChatApp(ctk.CTk):
         self.chat_title.configure(text=username)
         self._render_chat()
 
-    def _contact_pubkey(self, username: str) -> str | None:
-        for contact in self.contacts:
-            if contact["username"] == username:
-                return contact["public_key_armor"]
-        return None
-
     def _render_chat(self) -> None:
+        if not hasattr(self, "history"):
+            return
         self.history.configure(state="normal")
         self.history.delete("1.0", "end")
         if not self.selected_username:
             self.history.configure(state="disabled")
             return
-        rows = self.messages_by_peer.get(self.selected_username, [])
-        if not self.crypto.unlocked:
+        if not self.unlocked:
             self.history.insert("end", "Load your private key to decrypt this conversation.\n")
-            self.history.configure(state="disabled")
-            return
-        if not rows:
+            # Still show any placeholder lines if present.
+        rows = self.messages_by_peer.get(self.selected_username, [])
+        if not rows and self.unlocked:
             self.history.insert("end", "No messages yet.\n")
         for row in rows:
-            who = "you" if row["is_outgoing"] else row["sender_username"]
-            sender_pub = None if row["is_outgoing"] else self._contact_pubkey(row["sender_username"])
-            try:
-                text, verified = self.crypto.decrypt(row["ciphertext"], sender_pub)
-                mark = ""
-                if verified is True:
-                    mark = " ✓"
-                elif verified is False:
-                    mark = " (signature not verified)"
-                self.history.insert("end", f"{who}{mark}: {text}\n")
-            except CryptoError:
-                self.history.insert("end", f"{who}: [could not decrypt]\n")
+            who = row.get("who") or "?"
+            mark = row.get("mark") or ""
+            text = row.get("text") or ""
+            self.history.insert("end", f"{who}{mark}: {text}\n")
         self.history.see("end")
         self.history.configure(state="disabled")
 
@@ -317,39 +278,13 @@ class VaxChatApp(ctk.CTk):
             return
         if not text:
             return
-        if not self.crypto.unlocked:
+        if not self.unlocked:
             self._set_status("Load your private key before sending.")
-            return
-        their_pub = self._contact_pubkey(peer)
-        my_pub = self.crypto.public_key_armor
-        if not their_pub or not my_pub:
-            self._set_status("Missing a public key for this conversation.")
             return
         self.compose.delete(0, "end")
         self._busy = True
         self._set_status("Encrypting…")
-
-        def work() -> None:
-            try:
-                to_them = self.crypto.encrypt_for(text, their_pub)
-                to_me = self.crypto.encrypt_for(text, my_pub)
-                rows = self.api.send_message(peer, to_them, to_me)
-                err = None
-            except Exception as exc:
-                rows = []
-                err = str(exc)
-            self.after(0, lambda: self._send_done(rows, err))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _send_done(self, rows: list[dict], err: str | None) -> None:
-        self._busy = False
-        if err:
-            self._set_status(err)
-            return
-        self._ingest_messages(rows)
-        self._render_chat()
-        self._set_status("Sent.")
+        self.worker.submit("send", peer=peer, text=text)
 
     def _load_key_dialog(self) -> None:
         dialog = ctk.CTkToplevel(self)
@@ -377,12 +312,11 @@ class VaxChatApp(ctk.CTk):
 
         def accept() -> None:
             armor = box.get("1.0", "end").strip()
-            try:
-                self.crypto.load_private(armor, phrase.get())
-            except CryptoError as exc:
-                messagebox.showerror("Key", str(exc), parent=dialog)
+            if not armor:
+                messagebox.showerror("Key", "Paste or open a private key first.", parent=dialog)
                 return
-            self._after_key_loaded()
+            self._set_status("Loading key…")
+            self.worker.submit("load_key", armor=armor, passphrase=phrase.get())
             dialog.destroy()
 
         row = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -396,68 +330,56 @@ class VaxChatApp(ctk.CTk):
         dialog.geometry("420x240")
         dialog.transient(self)
         dialog.grab_set()
-        ctk.CTkLabel(dialog, text="A 2048-bit RSA key will be created on this machine.").pack(padx=16, pady=(16, 8))
+        ctk.CTkLabel(dialog, text="An Ed25519/Cv25519 key will be created on this machine.").pack(
+            padx=16, pady=(16, 8)
+        )
         name = ctk.CTkEntry(dialog, placeholder_text="Name on the key")
-        name.insert(0, self.api.username or "vaxchat")
+        name.insert(0, self.username or "vaxchat")
         name.pack(fill="x", padx=16, pady=6)
         phrase = ctk.CTkEntry(dialog, placeholder_text="Optional passphrase", show="•")
         phrase.pack(fill="x", padx=16, pady=6)
         status = ctk.CTkLabel(dialog, text="")
         status.pack(pady=4)
+        self._gen_dialog = dialog
+        self._gen_status = status
 
         def go() -> None:
             status.configure(text="Generating… this can take a few seconds.")
-            dialog.update_idletasks()
-
-            def work() -> None:
-                try:
-                    armor = self.crypto.generate(name.get().strip() or "vaxchat", phrase.get())
-                    err = None
-                except Exception as exc:
-                    armor = ""
-                    err = str(exc)
-                self.after(0, lambda: done(armor, err))
-
-            threading.Thread(target=work, daemon=True).start()
-
-            def done(armor: str, err: str | None) -> None:
-                if err:
-                    status.configure(text=err)
-                    return
-                path = filedialog.asksaveasfilename(
-                    parent=dialog,
-                    title="Save private key (keep this file secret)",
-                    defaultextension=".asc",
-                    filetypes=[("ASCII armor", "*.asc"), ("All files", "*.*")],
-                )
-                if path:
-                    with open(path, "w", encoding="utf-8") as handle:
-                        handle.write(armor)
-                    pub_path = path.replace(".asc", ".pub.asc")
-                    if pub_path == path:
-                        pub_path = path + ".pub"
-                    if self.crypto.public_key_armor:
-                        with open(pub_path, "w", encoding="utf-8") as handle:
-                            handle.write(self.crypto.public_key_armor)
-                self._after_key_loaded()
-                dialog.destroy()
+            self.worker.submit(
+                "generate_key",
+                name=name.get().strip() or "vaxchat",
+                passphrase=phrase.get(),
+            )
 
         ctk.CTkButton(dialog, text="Generate", command=go).pack(pady=12)
 
-    def _after_key_loaded(self) -> None:
-        fp = self.crypto.fingerprint or ""
+    def _on_key_generated(self, payload: dict) -> None:
+        dialog = getattr(self, "_gen_dialog", None)
+        armor = payload.get("private_armor") or ""
+        pub = payload.get("public_key_armor") or ""
+        fp = payload.get("fingerprint") or ""
+        if dialog is not None and dialog.winfo_exists():
+            path = filedialog.asksaveasfilename(
+                parent=dialog,
+                title="Save private key (keep this file secret)",
+                defaultextension=".asc",
+                filetypes=[("ASCII armor", "*.asc"), ("All files", "*.*")],
+            )
+            if path and armor:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(armor)
+                pub_path = path.replace(".asc", ".pub.asc")
+                if pub_path == path:
+                    pub_path = path + ".pub"
+                if pub:
+                    with open(pub_path, "w", encoding="utf-8") as handle:
+                        handle.write(pub)
+            dialog.destroy()
         short = fp[-8:] if fp else "?"
-        self.key_var.set(f"Private key loaded · {short}")
-        if self.crypto.public_key_armor:
-            def work() -> None:
-                try:
-                    self.api.publish_public_key(self.crypto.public_key_armor or "")
-                    err = None
-                except Exception as exc:
-                    err = str(exc)
-                self.after(0, lambda: self._set_status("Public key published." if not err else err))
-
-            threading.Thread(target=work, daemon=True).start()
+        if hasattr(self, "key_var"):
+            self.key_var.set(f"Private key loaded · {short}")
+        self.unlocked = True
+        self._set_status("Key generated.")
         self._render_chat()
 
     def _add_contact_dialog(self) -> None:
@@ -478,23 +400,11 @@ class VaxChatApp(ctk.CTk):
         def accept() -> None:
             username = user.get().strip()
             armor = box.get("1.0", "end").strip()
-
-            def work() -> None:
-                try:
-                    self.api.add_contact(username, armor)
-                    err = None
-                except Exception as exc:
-                    err = str(exc)
-                self.after(0, lambda: done(err))
-
-            def done(err: str | None) -> None:
-                if err:
-                    messagebox.showerror("Contact", err, parent=dialog)
-                    return
-                dialog.destroy()
-                self._refresh_contacts()
-
-            threading.Thread(target=work, daemon=True).start()
+            if not username:
+                messagebox.showerror("Contact", "Username required.", parent=dialog)
+                return
+            self.worker.submit("add_contact", username=username, public_key_armor=armor)
+            dialog.destroy()
 
         ctk.CTkButton(dialog, text="Add", command=accept).pack(pady=12)
 
@@ -502,26 +412,7 @@ class VaxChatApp(ctk.CTk):
         if not self.selected_username:
             self._set_status("Select a contact to remove.")
             return
-        name = self.selected_username
-
-        def work() -> None:
-            try:
-                self.api.delete_contact(name)
-                err = None
-            except Exception as exc:
-                err = str(exc)
-            self.after(0, lambda: done(err))
-
-        def done(err: str | None) -> None:
-            if err:
-                self._set_status(err)
-                return
-            self.selected_username = None
-            self.chat_title.configure(text="Select a contact")
-            self._refresh_contacts()
-            self._render_chat()
-
-        threading.Thread(target=work, daemon=True).start()
+        self.worker.submit("delete_contact", username=self.selected_username)
 
 
 def main() -> None:
