@@ -1,14 +1,23 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlmodel import Session, select
 
 from app.auth import get_current_user
+from app.config import get_settings
 from app.db import get_session
-from app.models import Message, Room, RoomMember, User
+from app.models import Message, Room, RoomInvite, RoomMember, User
 from app.pgp_util import is_pgp_message
 from app.rate_limit import limiter
-from app.schemas import RoomCreate, RoomMemberOut, RoomMessageIn, RoomMessageOut, RoomOut
+from app.schemas import (
+    RoomCreate,
+    RoomInviteCreate,
+    RoomInviteOut,
+    RoomMemberOut,
+    RoomMessageIn,
+    RoomMessageOut,
+    RoomOut,
+)
 
 router = APIRouter(prefix="/rooms", tags=["rooms"])
 
@@ -68,6 +77,40 @@ def _find_direct_room(session: Session, user_a: int, user_b: int) -> Room | None
     return None
 
 
+def _invite_out(session: Session, invite: RoomInvite) -> RoomInviteOut:
+    room = session.get(Room, invite.room_id)
+    return RoomInviteOut(
+        id=invite.id,
+        room_id=invite.room_id,
+        room_name=room.name if room else "?",
+        inviter_username=_username(session, invite.inviter_id),
+        invitee_username=_username(session, invite.invitee_id),
+        created_at=invite.created_at,
+    )
+
+
+def _create_invite(session: Session, room: Room, inviter: User, invitee: User) -> RoomInvite | None:
+    if room.is_direct:
+        raise HTTPException(status_code=400, detail="Cannot invite to a direct message room")
+    if invitee.id == inviter.id:
+        raise HTTPException(status_code=400, detail="Cannot invite yourself")
+    already = session.exec(
+        select(RoomMember).where(RoomMember.room_id == room.id, RoomMember.user_id == invitee.id)
+    ).first()
+    if already:
+        return None
+    existing = session.exec(
+        select(RoomInvite).where(RoomInvite.room_id == room.id, RoomInvite.invitee_id == invitee.id)
+    ).first()
+    if existing:
+        return existing
+    invite = RoomInvite(room_id=room.id, inviter_id=inviter.id, invitee_id=invitee.id)
+    session.add(invite)
+    session.commit()
+    session.refresh(invite)
+    return invite
+
+
 @router.get("", response_model=list[RoomOut])
 def list_rooms(
     user: Annotated[User, Depends(get_current_user)],
@@ -89,6 +132,10 @@ def create_room(
     user: Annotated[User, Depends(get_current_user)],
     session: Annotated[Session, Depends(get_session)],
 ):
+    settings = get_settings()
+    if len(body.member_usernames) > settings.max_room_members:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="too many member_usernames")
+
     if body.peer_username:
         peer_name = body.peer_username.strip().lower()
         if peer_name == user.username:
@@ -108,29 +155,98 @@ def create_room(
         session.commit()
         return _room_out(session, room)
 
-    names = sorted({n.strip().lower() for n in body.member_usernames if n.strip()})
-    if user.username not in names:
-        names.append(user.username)
-    names = sorted(set(names))
-    if len(names) < 2:
-        raise HTTPException(status_code=400, detail="Group rooms need at least one other member")
-
-    users: list[User] = []
-    for name in names:
+    # Groups: creator is the only member. Listed usernames receive invites (consent required).
+    invite_names = sorted(
+        {
+            n.strip().lower()
+            for n in body.member_usernames
+            if n.strip() and n.strip().lower() != user.username
+        }
+    )
+    invitees: list[User] = []
+    for name in invite_names:
         found = session.exec(select(User).where(User.username == name)).first()
         if found is None:
             raise HTTPException(status_code=404, detail=f"User not found: {name}")
-        users.append(found)
+        invitees.append(found)
 
-    room_name = body.name.strip() or ", ".join(n for n in names if n != user.username)
+    room_name = body.name.strip() or (
+        ", ".join(invite_names) if invite_names else f"{user.username}'s group"
+    )
     room = Room(name=room_name[:64], is_direct=False)
     session.add(room)
     session.commit()
     session.refresh(room)
-    for member in users:
-        session.add(RoomMember(room_id=room.id, user_id=member.id))
+    session.add(RoomMember(room_id=room.id, user_id=user.id))
+    session.commit()
+
+    for found in invitees:
+        _create_invite(session, room, user, found)
+
+    return _room_out(session, room)
+
+
+@router.get("/invites", response_model=list[RoomInviteOut])
+def list_my_invites(
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[Session, Depends(get_session)],
+):
+    rows = session.exec(select(RoomInvite).where(RoomInvite.invitee_id == user.id)).all()
+    return [_invite_out(session, row) for row in rows]
+
+
+@router.post("/{room_id}/invites", response_model=RoomInviteOut)
+def invite_member(
+    room_id: int,
+    body: RoomInviteCreate,
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[Session, Depends(get_session)],
+):
+    room = _require_membership(session, room_id, user.id)
+    invitee = session.exec(select(User).where(User.username == body.username.strip().lower())).first()
+    if invitee is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    invite = _create_invite(session, room, user, invitee)
+    if invite is None:
+        raise HTTPException(status_code=400, detail="User is already a member")
+    return _invite_out(session, invite)
+
+
+@router.post("/invites/{invite_id}/accept", response_model=RoomOut)
+def accept_invite(
+    invite_id: int,
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[Session, Depends(get_session)],
+):
+    invite = session.get(RoomInvite, invite_id)
+    if invite is None or invite.invitee_id != user.id:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    room = session.get(Room, invite.room_id)
+    if room is None:
+        session.delete(invite)
+        session.commit()
+        raise HTTPException(status_code=404, detail="Room not found")
+    existing = session.exec(
+        select(RoomMember).where(RoomMember.room_id == room.id, RoomMember.user_id == user.id)
+    ).first()
+    if not existing:
+        session.add(RoomMember(room_id=room.id, user_id=user.id))
+    session.delete(invite)
     session.commit()
     return _room_out(session, room)
+
+
+@router.post("/invites/{invite_id}/decline", status_code=status.HTTP_204_NO_CONTENT)
+def decline_invite(
+    invite_id: int,
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[Session, Depends(get_session)],
+):
+    invite = session.get(RoomInvite, invite_id)
+    if invite is None or invite.invitee_id != user.id:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    session.delete(invite)
+    session.commit()
 
 
 @router.get("/{room_id}", response_model=RoomOut)
@@ -163,6 +279,9 @@ async def send_room_message(
     session: Annotated[Session, Depends(get_session)],
 ):
     _require_membership(session, room_id, user.id)
+    settings = get_settings()
+    if len(body.ciphertext) > settings.max_ciphertext_chars:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="ciphertext too large")
     if not is_pgp_message(body.ciphertext):
         raise HTTPException(status_code=400, detail="Messages must be ASCII-armored PGP MESSAGE blocks")
     row = Message(

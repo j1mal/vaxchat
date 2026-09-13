@@ -1,15 +1,24 @@
-import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session, select
 
-from app.auth import create_access_token, get_current_user, hash_password, verify_password
+from app.auth import (
+    create_access_token,
+    get_bearer_token,
+    get_current_user,
+    hash_password,
+    purge_expired_revocations,
+    revoke_token,
+    verify_password,
+)
+from app.config import get_settings
 from app.db import get_session
 from app.models import User
+from app.pgp_util import is_pgp_public_key
 from app.rate_limit import limiter
 from app.schemas import LoginIn, MeOut, MeUpdate, RegisterIn, TokenOut
-from app.pgp_util import is_pgp_public_key
+import re
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
 
@@ -33,7 +42,9 @@ def register(request: Request, body: RegisterIn, session: Annotated[Session, Dep
     username = normalize_username(body.username)
     existing = session.exec(select(User).where(User.username == username)).first()
     if existing:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username taken")
+        # Soften username enumeration: generic conflict text (status still 409).
+        detail = "Username taken" if get_settings().allow_username_taken_detail else "Could not create account"
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
     user = User(username=username, password_hash=hash_password(body.password))
     session.add(user)
     session.commit()
@@ -52,7 +63,13 @@ def login(request: Request, body: LoginIn, session: Annotated[Session, Depends(g
 
 
 @router.post("/logout")
-def logout(_user: Annotated[User, Depends(get_current_user)]):
+def logout(
+    user: Annotated[User, Depends(get_current_user)],
+    token: Annotated[str, Depends(get_bearer_token)],
+    session: Annotated[Session, Depends(get_session)],
+):
+    purge_expired_revocations(session)
+    revoke_token(session, token, user.id)
     return {"ok": True}
 
 
@@ -67,6 +84,9 @@ def update_me(
     user: Annotated[User, Depends(get_current_user)],
     session: Annotated[Session, Depends(get_session)],
 ):
+    settings = get_settings()
+    if len(body.public_key_armor) > settings.max_public_key_chars:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="public_key_armor too large")
     if not is_pgp_public_key(body.public_key_armor):
         raise HTTPException(status_code=400, detail="Expected an ASCII-armored PGP public key")
     user.public_key_armor = body.public_key_armor.strip()

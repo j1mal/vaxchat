@@ -83,6 +83,8 @@ class VaxChatApp(ctk.CTk):
         elif kind == "rooms":
             self.rooms = payload.get("rooms") or []
             self._redraw_rooms()
+        elif kind == "invites":
+            self._redraw_invites(payload.get("invites") or [])
         elif kind == "messages":
             self.messages_by_room = payload.get("messages_by_room") or {}
             self.unlocked = bool(payload.get("unlocked"))
@@ -204,7 +206,12 @@ class VaxChatApp(ctk.CTk):
             side="left", padx=2
         )
         self.room_list = ctk.CTkScrollableFrame(left, fg_color=COLOR_SIDEBAR, width=260)
-        self.room_list.pack(fill="both", expand=True, padx=8, pady=(0, 12))
+        self.room_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        ctk.CTkLabel(left, text="Invites", font=ctk.CTkFont(size=14, weight="bold"), text_color=COLOR_MUTED).pack(
+            anchor="w", padx=16, pady=(4, 4)
+        )
+        self.invite_list = ctk.CTkScrollableFrame(left, fg_color=COLOR_SIDEBAR, width=260, height=100)
+        self.invite_list.pack(fill="x", padx=8, pady=(0, 12))
 
         right = ctk.CTkFrame(root, fg_color=COLOR_BG, corner_radius=0)
         right.grid(row=1, column=1, sticky="nsew")
@@ -244,6 +251,7 @@ class VaxChatApp(ctk.CTk):
 
         self._redraw_rooms()
         self.worker.submit("refresh_rooms")
+        self.worker.submit("refresh_invites")
 
     def _logout(self) -> None:
         self.worker.submit("logout")
@@ -286,6 +294,37 @@ class VaxChatApp(ctk.CTk):
             )
             btn.pack(fill="x", pady=2, padx=4)
             self._room_buttons[room_id] = btn
+
+    def _redraw_invites(self, invites: list[dict]) -> None:
+        if not hasattr(self, "invite_list"):
+            return
+        for child in self.invite_list.winfo_children():
+            child.destroy()
+        if not invites:
+            ctk.CTkLabel(self.invite_list, text="None", text_color=COLOR_MUTED, anchor="w").pack(
+                fill="x", padx=4, pady=2
+            )
+            return
+        for invite in invites:
+            row = ctk.CTkFrame(self.invite_list, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            label = f"{invite.get('room_name')} · from {invite.get('inviter_username')}"
+            ctk.CTkLabel(row, text=label, text_color=COLOR_TEXT, anchor="w").pack(side="left", padx=4)
+            iid = int(invite["id"])
+            ctk.CTkButton(
+                row,
+                text="Join",
+                width=48,
+                fg_color=COLOR_ACCENT,
+                command=lambda invite_id=iid: self.worker.submit("accept_invite", invite_id=invite_id),
+            ).pack(side="right", padx=2)
+            ctk.CTkButton(
+                row,
+                text="×",
+                width=28,
+                fg_color=COLOR_INPUT,
+                command=lambda invite_id=iid: self.worker.submit("decline_invite", invite_id=invite_id),
+            ).pack(side="right", padx=2)
 
     def _select_room(self, room_id: int) -> None:
         self.selected_room_id = room_id
@@ -402,9 +441,11 @@ class VaxChatApp(ctk.CTk):
         ctk.CTkLabel(dialog, text="Group name", text_color=COLOR_TEXT).pack(anchor="w", padx=16, pady=(16, 4))
         name = ctk.CTkEntry(dialog, fg_color=COLOR_INPUT)
         name.pack(fill="x", padx=16)
-        ctk.CTkLabel(dialog, text="Members (comma-separated usernames)", text_color=COLOR_TEXT).pack(
-            anchor="w", padx=16, pady=(12, 4)
-        )
+        ctk.CTkLabel(
+            dialog,
+            text="Invitees (comma-separated; they must accept)",
+            text_color=COLOR_TEXT,
+        ).pack(anchor="w", padx=16, pady=(12, 4))
         members = ctk.CTkEntry(dialog, fg_color=COLOR_INPUT)
         members.pack(fill="x", padx=16)
 
@@ -413,7 +454,7 @@ class VaxChatApp(ctk.CTk):
             self.worker.submit("create_group", name=name.get().strip(), member_usernames=names)
             dialog.destroy()
 
-        ctk.CTkButton(dialog, text="Create", fg_color=COLOR_ACCENT, command=accept).pack(pady=16)
+        ctk.CTkButton(dialog, text="Create & invite", fg_color=COLOR_ACCENT, command=accept).pack(pady=16)
 
     def _load_key_dialog(self) -> None:
         dialog = ctk.CTkToplevel(self)

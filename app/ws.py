@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlmodel import Session, select
 
-from app.auth import decode_token
+from app.auth import decode_token, is_token_revoked
 from app.db import get_engine
 from app.models import RoomMember, User
 
@@ -18,8 +18,7 @@ class ConnectionManager:
         self._rooms: dict[int, set[WebSocket]] = defaultdict(set)
         self._lock = asyncio.Lock()
 
-    async def connect(self, room_id: int, websocket: WebSocket) -> None:
-        await websocket.accept()
+    async def register(self, room_id: int, websocket: WebSocket) -> None:
         async with self._lock:
             self._rooms[room_id].add(websocket)
 
@@ -53,10 +52,13 @@ def user_from_token(token: str) -> User | None:
         payload = decode_token(token)
     except Exception:
         return None
+    jti = payload.get("jti")
     user_id = payload.get("uid")
     if user_id is None:
         return None
     with Session(get_engine()) as session:
+        if is_token_revoked(session, jti):
+            return None
         return session.get(User, user_id)
 
 
@@ -69,16 +71,22 @@ def is_room_member(room_id: int, user_id: int) -> bool:
 
 
 @router.websocket("/ws/{room_id}")
-async def room_websocket(
-    websocket: WebSocket,
-    room_id: int,
-    token: str = Query(...),
-):
-    user = user_from_token(token)
+async def room_websocket(websocket: WebSocket, room_id: int):
+    # Accept first, then require an auth frame — avoids putting JWTs in query strings / access logs.
+    await websocket.accept()
+    try:
+        raw = await asyncio.wait_for(websocket.receive_json(), timeout=15.0)
+    except Exception:
+        await websocket.close(code=4401)
+        return
+    if not isinstance(raw, dict) or raw.get("type") != "auth" or not raw.get("token"):
+        await websocket.close(code=4401)
+        return
+    user = user_from_token(str(raw["token"]))
     if user is None or not is_room_member(room_id, user.id):
         await websocket.close(code=4403)
         return
-    await manager.connect(room_id, websocket)
+    await manager.register(room_id, websocket)
     try:
         while True:
             # Clients send via HTTP POST; keep the socket open for server pushes.

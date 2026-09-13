@@ -26,20 +26,34 @@ def reset_engine() -> None:
     _engine = None
 
 
-def _message_columns(engine) -> set[str]:
+def _table_columns(engine, table: str) -> set[str]:
     insp = inspect(engine)
-    if not insp.has_table("message"):
+    if not insp.has_table(table):
         return set()
-    return {col["name"] for col in insp.get_columns("message")}
+    return {col["name"] for col in insp.get_columns(table)}
+
+
+def _schema_outdated(engine) -> bool:
+    msg_cols = _table_columns(engine, "message")
+    if msg_cols and "room_id" not in msg_cols:
+        return True
+    contact_cols = _table_columns(engine, "contact")
+    if contact_cols and "fingerprint" not in contact_cols:
+        return True
+    insp = inspect(engine)
+    if insp.has_table("message") and not insp.has_table("revokedtoken"):
+        # New table is fine via create_all; no wipe needed.
+        pass
+    if insp.has_table("message") and not insp.has_table("roominvite"):
+        pass
+    return False
 
 
 def init_db() -> None:
     from app import models  # noqa: F401
 
     engine = get_engine()
-    cols = _message_columns(engine)
-    # create_all does not alter existing tables; wipe outdated message schema.
-    if cols and "room_id" not in cols:
+    if _schema_outdated(engine):
         SQLModel.metadata.drop_all(engine)
     SQLModel.metadata.create_all(engine)
 

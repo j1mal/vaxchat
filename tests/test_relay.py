@@ -1,11 +1,14 @@
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.db import init_db, reset_engine
-from client.crypto import CryptoSession
+from app.pgp_util import is_pgp_message
+from client.crypto import CryptoError, CryptoSession
+from client.worker import BackgroundWorker
 
 TESTKEYS = Path(__file__).resolve().parents[1] / "testkeys"
 
@@ -15,12 +18,13 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     db_path = (tmp_path / "test.db").as_posix()
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-for-jwt-please-ignore")
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("VAXCHAT_DOCS", "false")
     get_settings.cache_clear()
     reset_engine()
-    from app.main import app
+    from app.main import create_app
 
     init_db()
-    with TestClient(app) as test_client:
+    with TestClient(create_app()) as test_client:
         yield test_client
     get_settings.cache_clear()
     reset_engine()
@@ -46,6 +50,11 @@ def test_health(client: TestClient) -> None:
     assert client.get("/health").json() == {"ok": True}
 
 
+def test_docs_disabled_by_default(client: TestClient) -> None:
+    assert client.get("/docs").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+
+
 def test_register_login_and_me(client: TestClient) -> None:
     token = _register(client, "alice")
     me = client.get("/me", headers=_auth(token))
@@ -58,10 +67,18 @@ def test_register_login_and_me(client: TestClient) -> None:
     assert login.json()["username"] == "alice"
 
 
-def test_duplicate_username(client: TestClient) -> None:
+def test_duplicate_username_soft_detail(client: TestClient) -> None:
     _register(client, "alice")
     again = client.post("/auth/register", json={"username": "alice", "password": "password123"})
     assert again.status_code == 409
+    assert again.json()["detail"] == "Could not create account"
+
+
+def test_logout_revokes_token(client: TestClient) -> None:
+    token = _register(client, "alice")
+    assert client.get("/me", headers=_auth(token)).status_code == 200
+    assert client.post("/auth/logout", headers=_auth(token)).status_code == 200
+    assert client.get("/me", headers=_auth(token)).status_code == 401
 
 
 def test_rejects_plaintext_message(client: TestClient) -> None:
@@ -78,6 +95,41 @@ def test_rejects_plaintext_message(client: TestClient) -> None:
     assert response.status_code == 400
 
 
+def test_rejects_fake_armored_junk(client: TestClient) -> None:
+    alice = _register(client, "alice")
+    _register(client, "bob")
+    dm = client.post("/rooms", headers=_auth(alice), json={"peer_username": "bob"})
+    room_id = dm.json()["id"]
+    junk = "-----BEGIN PGP MESSAGE-----\n\njunk\n-----END PGP MESSAGE-----\n"
+    assert is_pgp_message(junk) is False
+    response = client.post(
+        f"/rooms/{room_id}/messages",
+        headers=_auth(alice),
+        json={"ciphertext": junk},
+    )
+    assert response.status_code == 400
+
+
+def test_oversized_ciphertext_rejected(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAX_CIPHERTEXT_CHARS", "200")
+    get_settings.cache_clear()
+    alice = _register(client, "alice")
+    _register(client, "bob")
+    dm = client.post("/rooms", headers=_auth(alice), json={"peer_username": "bob"})
+    room_id = dm.json()["id"]
+    # Valid-looking multi-line base64 body, but over the capped size.
+    body_lines = ["A" * 64 for _ in range(8)]
+    huge = "-----BEGIN PGP MESSAGE-----\n\n" + "\n".join(body_lines) + "\n-----END PGP MESSAGE-----\n"
+    assert len(huge) > 200
+    response = client.post(
+        f"/rooms/{room_id}/messages",
+        headers=_auth(alice),
+        json={"ciphertext": huge},
+    )
+    assert response.status_code in (400, 413)
+    get_settings.cache_clear()
+
+
 def test_dm_room_get_or_create(client: TestClient) -> None:
     alice = _register(client, "alice")
     _register(client, "bob")
@@ -92,6 +144,35 @@ def test_dm_room_get_or_create(client: TestClient) -> None:
     assert len(rooms.json()) == 1
 
 
+def test_group_invite_required_not_force_add(client: TestClient) -> None:
+    alice = _register(client, "alice")
+    bob = _register(client, "bob")
+    created = client.post(
+        "/rooms",
+        headers=_auth(alice),
+        json={"name": "crew", "member_usernames": ["bob"]},
+    )
+    assert created.status_code == 200
+    room_id = created.json()["id"]
+    members = {m["username"] for m in created.json()["members"]}
+    assert members == {"alice"}
+
+    bob_rooms = client.get("/rooms", headers=_auth(bob))
+    assert all(r["id"] != room_id for r in bob_rooms.json())
+
+    invites = client.get("/rooms/invites", headers=_auth(bob))
+    assert invites.status_code == 200
+    assert len(invites.json()) == 1
+    invite_id = invites.json()[0]["id"]
+
+    denied = client.get(f"/rooms/{room_id}/messages", headers=_auth(bob))
+    assert denied.status_code == 403
+
+    accepted = client.post(f"/rooms/invites/{invite_id}/accept", headers=_auth(bob))
+    assert accepted.status_code == 200
+    assert {m["username"] for m in accepted.json()["members"]} == {"alice", "bob"}
+
+
 def test_encrypted_roundtrip(client: TestClient) -> None:
     alice_token = _register(client, "alice")
     bob_token = _register(client, "bob")
@@ -104,14 +185,19 @@ def test_encrypted_roundtrip(client: TestClient) -> None:
     dm = client.post("/rooms", headers=_auth(alice_token), json={"peer_username": "bob"})
     assert dm.status_code == 200
     room_id = dm.json()["id"]
-    members = client.get(f"/rooms/{room_id}/members", headers=_auth(alice_token))
-    assert members.status_code == 200
-    pubs = [m["public_key_armor"] for m in members.json() if m.get("public_key_armor")]
-    assert len(pubs) == 2
+    # Pin bob's published key as a contact (encrypt path must prefer pins).
+    assert (
+        client.post(
+            "/contacts",
+            headers=_auth(alice_token),
+            json={"username": "bob", "public_key_armor": bob.public_key_armor},
+        ).status_code
+        == 200
+    )
+    pubs = [alice.public_key_armor, bob.public_key_armor]
 
     secret = "meet at dusk"
     ciphertext = alice.encrypt_message(secret, pubs)
-    # Re-encrypt to same members must not fail on keyring conflicts.
     ciphertext2 = alice.encrypt_message(secret, pubs)
     assert "BEGIN PGP MESSAGE" in ciphertext2
     assert secret not in ciphertext
@@ -142,6 +228,34 @@ def test_encrypted_roundtrip(client: TestClient) -> None:
     bob.clear()
 
 
+def test_member_pubkeys_prefers_contact_pin() -> None:
+    import queue
+
+    out: queue.Queue = queue.Queue()
+    worker = BackgroundWorker(out)
+    try:
+        bob_real = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n" + ("B" * 64 + "\n") * 2 + "-----END PGP PUBLIC KEY BLOCK-----\n"
+        bob_evil = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n" + ("E" * 64 + "\n") * 2 + "-----END PGP PUBLIC KEY BLOCK-----\n"
+        worker._state.username = "alice"
+        worker._state.contacts = [{"username": "bob", "public_key_armor": bob_real}]
+        worker._crypto.public_key_armor = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n" + ("A" * 64 + "\n") * 2 + "-----END PGP PUBLIC KEY BLOCK-----\n"
+
+        worker._api = MagicMock()
+        worker._api.room_members.return_value = [
+            {"username": "alice", "public_key_armor": worker._crypto.public_key_armor},
+            {"username": "bob", "public_key_armor": bob_evil},
+        ]
+        pubs = worker._member_pubkeys(1)
+        assert bob_real.strip() in pubs
+        assert bob_evil.strip() not in pubs
+
+        worker._state.contacts = []
+        with pytest.raises(CryptoError, match="Pin a contact"):
+            worker._member_pubkeys(1)
+    finally:
+        worker.shutdown()
+
+
 @pytest.mark.skipif(not (TESTKEYS / "jamalpriv.asc").exists(), reason="testkeys not present")
 def test_real_testkeys_roundtrip(client: TestClient) -> None:
     jamal_token = _register(client, "jamal")
@@ -163,7 +277,6 @@ def test_real_testkeys_roundtrip(client: TestClient) -> None:
 
     secret = "tea at dusk with real keys"
     ciphertext = jamal.encrypt_message(secret, [jamal_pub, jamal1_pub])
-    # Second encrypt to same peers — must not raise on duplicate import.
     jamal.encrypt_message(secret, [jamal_pub, jamal1_pub])
 
     sent = client.post(
@@ -205,7 +318,7 @@ def test_non_member_cannot_read_room(client: TestClient) -> None:
     assert denied.status_code == 403
 
 
-def test_websocket_rejects_non_member(client: TestClient) -> None:
+def test_websocket_auth_first_message_no_query_token(client: TestClient) -> None:
     from starlette.websockets import WebSocketDisconnect
 
     alice = _register(client, "alice")
@@ -213,6 +326,17 @@ def test_websocket_rejects_non_member(client: TestClient) -> None:
     charlie = _register(client, "charlie")
     dm = client.post("/rooms", headers=_auth(alice), json={"peer_username": "bob"})
     room_id = dm.json()["id"]
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(f"/ws/{room_id}?token={charlie}"):
-            pass
+
+    with client.websocket_connect(f"/ws/{room_id}") as ws:
+        ws.send_json({"type": "auth", "token": charlie})
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_text()
+
+    with client.websocket_connect(f"/ws/{room_id}") as ws:
+        ws.send_json({"type": "auth", "token": alice})
+
+    # Query string alone must not authenticate; bad first-message auth still fails.
+    with client.websocket_connect(f"/ws/{room_id}?token={alice}") as ws:
+        ws.send_json({"type": "auth", "token": "not-a-token"})
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_text()

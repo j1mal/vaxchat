@@ -113,6 +113,19 @@ class ChatApi:
             )
         )
 
+    def list_invites(self) -> list[dict]:
+        return self._parse(self._http.get(f"{self.base_url}/rooms/invites", headers=self._headers()))
+
+    def accept_invite(self, invite_id: int) -> dict:
+        return self._parse(
+            self._http.post(f"{self.base_url}/rooms/invites/{invite_id}/accept", headers=self._headers())
+        )
+
+    def decline_invite(self, invite_id: int) -> None:
+        self._parse(
+            self._http.post(f"{self.base_url}/rooms/invites/{invite_id}/decline", headers=self._headers())
+        )
+
     def room_members(self, room_id: int) -> list[dict]:
         return self._parse(self._http.get(f"{self.base_url}/rooms/{room_id}/members", headers=self._headers()))
 

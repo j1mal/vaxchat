@@ -6,8 +6,6 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
-
 from websockets.sync.client import connect as ws_connect
 
 from client.api import ChatApi
@@ -94,6 +92,7 @@ class BackgroundWorker:
             self._emit("auth_ok", username=self._api.username)
             self._refresh_contacts()
             self._refresh_rooms()
+            self._refresh_invites()
         elif kind == "register":
             self._api.base_url = str(payload.get("server") or self._api.base_url).rstrip("/")
             self._api.register(payload["username"], payload["password"])
@@ -101,6 +100,7 @@ class BackgroundWorker:
             self._emit("auth_ok", username=self._api.username)
             self._refresh_contacts()
             self._refresh_rooms()
+            self._refresh_invites()
         elif kind == "logout":
             self._stop_all_ws()
             self._api.logout()
@@ -133,9 +133,24 @@ class BackgroundWorker:
         elif kind == "create_group":
             room = self._api.create_group(payload.get("name") or "", payload.get("member_usernames") or [])
             self._refresh_rooms()
+            self._refresh_invites()
             self._emit("room_opened", room_id=room["id"])
+            self._emit(
+                "status",
+                text="Group created. Listed users were invited (they must accept before joining).",
+            )
         elif kind == "refresh_contacts":
             self._refresh_contacts()
+        elif kind == "refresh_invites":
+            self._refresh_invites()
+        elif kind == "accept_invite":
+            room = self._api.accept_invite(int(payload["invite_id"]))
+            self._refresh_invites()
+            self._refresh_rooms()
+            self._emit("room_opened", room_id=room["id"])
+        elif kind == "decline_invite":
+            self._api.decline_invite(int(payload["invite_id"]))
+            self._refresh_invites()
         elif kind == "add_contact":
             self._api.add_contact(payload["username"], payload.get("public_key_armor") or "")
             self._refresh_contacts()
@@ -210,10 +225,19 @@ class BackgroundWorker:
         self._state.contacts = rows
         self._emit("contacts", contacts=rows)
 
+    def _refresh_invites(self) -> None:
+        try:
+            rows = self._api.list_invites()
+        except Exception as exc:
+            self._emit("status", text=f"Invites refresh failed: {exc}")
+            return
+        self._emit("invites", invites=rows)
+
     def _contact_pubkey(self, username: str) -> str | None:
         for contact in self._state.contacts:
             if contact.get("username") == username:
-                return contact.get("public_key_armor")
+                armor = (contact.get("public_key_armor") or "").strip()
+                return armor or None
         return None
 
     def _stop_all_ws(self) -> None:
@@ -251,9 +275,10 @@ class BackgroundWorker:
             if not token:
                 time.sleep(0.5)
                 continue
-            url = f"{self._api.ws_base()}/ws/{room_id}?token={quote(token, safe='')}"
+            url = f"{self._api.ws_base()}/ws/{room_id}"
             try:
                 with ws_connect(url, open_timeout=10, close_timeout=2) as socket:
+                    socket.send(json.dumps({"type": "auth", "token": token}))
                     delay = 1.0
                     self._emit("status", text=f"WS connected · room {room_id}")
                     self._catch_up(room_id)
@@ -309,18 +334,42 @@ class BackgroundWorker:
             self._emit_messages()
 
     def _member_pubkeys(self, room_id: int) -> list[str]:
+        """Contact-pinned keys win. Server member pubs are not used without a pin."""
         members = self._api.room_members(room_id)
         pubs: list[str] = []
         seen: set[str] = set()
+        missing: list[str] = []
         for member in members:
             username = member.get("username") or ""
-            armor = (member.get("public_key_armor") or "").strip()
-            if not armor:
+            if username == self._state.username:
+                armor = (self._crypto.public_key_armor or "").strip()
+            else:
                 armor = (self._contact_pubkey(username) or "").strip()
+                if not armor:
+                    missing.append(username)
+                    continue
             if armor and armor not in seen:
                 seen.add(armor)
                 pubs.append(armor)
+        if missing:
+            raise CryptoError(
+                "Pin a contact public key for: " + ", ".join(missing) + " (server keys are not trusted until pinned)."
+            )
         return pubs
+
+    def _sender_pubkey_for_verify(self, room_id: int, sender_username: str | None) -> str | None:
+        if not sender_username:
+            return None
+        pinned = self._contact_pubkey(sender_username)
+        if pinned:
+            return pinned
+        for room in self._state.rooms:
+            if int(room["id"]) != room_id:
+                continue
+            for member in room.get("members") or []:
+                if member.get("username") == sender_username:
+                    return member.get("public_key_armor")
+        return None
 
     def _display_from_row(self, row: dict, room_id: int) -> DisplayMessage:
         who = "you" if row.get("is_outgoing") else row.get("sender_username") or "?"
@@ -334,14 +383,7 @@ class BackgroundWorker:
             )
         sender_pub = None
         if not row.get("is_outgoing"):
-            # Prefer published key from room membership cache if present on the room object.
-            for room in self._state.rooms:
-                if int(room["id"]) != room_id:
-                    continue
-                for member in room.get("members") or []:
-                    if member.get("username") == row.get("sender_username"):
-                        sender_pub = member.get("public_key_armor")
-                        break
+            sender_pub = self._sender_pubkey_for_verify(room_id, row.get("sender_username"))
         try:
             with self._lock:
                 text, verified = self._crypto.decrypt(row["ciphertext"], sender_pub)

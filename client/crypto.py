@@ -166,7 +166,12 @@ class CryptoSession:
         raise CryptoError("Could not import recipient public key.")
 
     def encrypt_message(self, plaintext: str, recipient_public_armors: list[str]) -> str:
-        """Encrypt once to every recipient pubkey (multi-recipient OpenPGP). Safe to re-call."""
+        """Encrypt once to every recipient pubkey (multi-recipient OpenPGP).
+
+        Callers must pass only pinned / explicitly accepted public keys (and self).
+        always_trust applies only to those caller-chosen recipients in this ephemeral
+        GnuPG home — it is not a license to encrypt to arbitrary server-published keys.
+        """
         if not self.unlocked or self._gpg is None or not self.fingerprint:
             raise CryptoError("Load your private key first.")
         if not recipient_public_armors:
@@ -182,6 +187,10 @@ class CryptoSession:
                 fingerprints.append(fp)
         if not fingerprints:
             raise CryptoError("Could not import any recipient public keys.")
+        try:
+            self._gpg.trust_keys(fingerprints, "TRUST_FULLY")
+        except Exception:
+            pass
         encrypted = self._gpg.encrypt(
             plaintext,
             fingerprints,

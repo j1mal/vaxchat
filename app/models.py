@@ -23,6 +23,7 @@ class Contact(SQLModel, table=True):
     owner_id: int = Field(foreign_key="user.id", index=True)
     contact_user_id: int = Field(foreign_key="user.id", index=True)
     public_key_armor: str
+    fingerprint: str = Field(default="", index=True, max_length=128)
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -42,9 +43,28 @@ class RoomMember(SQLModel, table=True):
     joined_at: datetime = Field(default_factory=utcnow)
 
 
+class RoomInvite(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("room_id", "invitee_id"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    room_id: int = Field(foreign_key="room.id", index=True)
+    inviter_id: int = Field(foreign_key="user.id", index=True)
+    invitee_id: int = Field(foreign_key="user.id", index=True)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class Message(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     room_id: int = Field(foreign_key="room.id", index=True)
     sender_id: int = Field(foreign_key="user.id", index=True)
     ciphertext: str
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class RevokedToken(SQLModel, table=True):
+    """JWT denylist keyed by jti until the token's natural expiry."""
+
+    jti: str = Field(primary_key=True, max_length=64)
+    user_id: int = Field(index=True)
+    expires_at: datetime = Field(index=True)
+    revoked_at: datetime = Field(default_factory=utcnow)
