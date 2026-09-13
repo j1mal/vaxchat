@@ -1,5 +1,7 @@
 # vaxchat
 
+> **Warning:** This project was entirely made with AI and is only for research and testing purposes. Do not use it for real private communication or production.
+
 Privacy-focused chat: **FastAPI** is a ciphertext relay (HTTP + WebSockets). A **CustomTkinter** client encrypts with **GnuPG** locally (multi-recipient OpenPGP for rooms).
 
 ## Threat model
